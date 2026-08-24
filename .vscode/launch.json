@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Train BanglaT5 QA (baseline)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/train.py",
+      "args": ["--source", "base"],
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/bin/python"
+    },
+    {
+      "name": "Train BanglaT5 QA (transfer from summarization)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/train.py",
+      "args": ["--source", "summarization"],
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/bin/python"
+    },
+    {
+      "name": "Evaluate baseline",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/evaluate_model.py",
+      "args": ["--source", "base"],
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/bin/python"
+    },
+    {
+      "name": "Evaluate transfer",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/evaluate_model.py",
+      "args": ["--source", "summarization"],
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/bin/python"
+    }
+  ]
+}
