@@ -3,5 +3,6 @@ datasets>=2.18,<3.0
 accelerate>=0.30
 sentencepiece>=0.1.99
 bert-score>=0.3.13
+rouge-score>=0.1.2
 numpy
 tqdm

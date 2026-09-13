@@ -2,9 +2,13 @@
 Evaluates a fine-tuned QA model on validation and test splits.
 Metrics: EM, F1, BERTScore-F1 -- identical to bangla-qa-banglat5.
 
+For --source joint, also evaluates the same checkpoint on D_S (summarization,
+data/summary_bn) with ROUGE-1/2/L, since that condition was trained on both tasks.
+
 Usage:
   python src/evaluate_model.py --source base
   python src/evaluate_model.py --source summarization
+  python src/evaluate_model.py --source joint
 """
 
 import argparse
@@ -18,6 +22,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from datasets import Dataset
 from tqdm import tqdm
 from bert_score import score as bert_score_fn
+from rouge_score import rouge_scorer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 if not hasattr(PreTrainedTokenizerBase, "build_inputs_with_special_tokens"):
@@ -30,9 +35,11 @@ if not hasattr(PreTrainedTokenizerBase, "build_inputs_with_special_tokens"):
     PreTrainedTokenizerBase.build_inputs_with_special_tokens = _build_inputs_with_special_tokens
 
 DATA_DIR = Path("data/squad_bn")
+SUMMARY_DATA_DIR = Path("data/summary_bn")
 RESULTS_DIR = Path("outputs/results")
 MAX_INPUT_LENGTH = 512
 MAX_TARGET_LENGTH = 64
+SUMMARY_MAX_TARGET_LENGTH = 128
 BATCH_SIZE = 16
 NUM_BEAMS = 4
 BERTSCORE_MODEL = "bert-base-multilingual-cased"
@@ -58,12 +65,8 @@ def load_squad_json(path):
     return Dataset.from_dict({"id": ids, "question": questions, "context": contexts, "answers": answers})
 
 
-def generate_predictions(model, tokenizer, dataset, device):
+def generate_from_inputs(model, tokenizer, inputs, device, max_new_tokens):
     model.eval()
-    inputs = [
-        f"question: {q} context: {c}"
-        for q, c in zip(dataset["question"], dataset["context"])
-    ]
     predictions = []
     for i in tqdm(range(0, len(inputs), BATCH_SIZE), desc="generating"):
         batch = inputs[i : i + BATCH_SIZE]
@@ -77,13 +80,21 @@ def generate_predictions(model, tokenizer, dataset, device):
         with torch.no_grad():
             output_ids = model.generate(
                 **encoded,
-                max_new_tokens=MAX_TARGET_LENGTH,
+                max_new_tokens=max_new_tokens,
                 num_beams=NUM_BEAMS,
                 early_stopping=True,
             )
         decoded = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
         predictions.extend(decoded)
     return predictions
+
+
+def generate_predictions(model, tokenizer, dataset, device):
+    inputs = [
+        f"question: {q} context: {c}"
+        for q, c in zip(dataset["question"], dataset["context"])
+    ]
+    return generate_from_inputs(model, tokenizer, inputs, device, MAX_TARGET_LENGTH)
 
 
 def normalize(s):
@@ -135,6 +146,49 @@ def compute_bertscore(predictions, dataset, device):
     return 100 * float(f1.mean())
 
 
+def load_summary_json(path):
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    return Dataset.from_dict({
+        "id": [ex["id"] for ex in raw],
+        "article": [ex["article"] for ex in raw],
+        "summary": [ex["summary"] for ex in raw],
+    })
+
+
+class _WhitespaceTokenizer:
+    """rouge_score's default tokenizer only matches ASCII [a-z0-9]+, silently
+    dropping all Bangla text (0 tokens -> every score 0.0). Split on whitespace
+    instead, consistent with how the rest of this repo treats Bangla text."""
+    def tokenize(self, text):
+        return text.split()
+
+
+def compute_rouge(predictions, references):
+    scorer = rouge_scorer.RougeScorer(
+        ["rouge1", "rouge2", "rougeL"], use_stemmer=False, tokenizer=_WhitespaceTokenizer()
+    )
+    totals = {"rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0}
+    for pred, ref in zip(predictions, references):
+        scores = scorer.score(ref, pred)
+        for key in totals:
+            totals[key] += scores[key].fmeasure
+    n = len(predictions)
+    return {key: 100 * val / n for key, val in totals.items()}
+
+
+def evaluate_summary_split(split, tokenizer, model, device):
+    print(f"\n=== D_S {split} ===")
+    ds = load_summary_json(SUMMARY_DATA_DIR / f"{split}.json")
+    inputs = [f"summarize: {a}" for a in ds["article"]]
+    preds = generate_from_inputs(model, tokenizer, inputs, device, SUMMARY_MAX_TARGET_LENGTH)
+    metrics = compute_rouge(preds, ds["summary"])
+    metrics["N"] = len(ds)
+    print(f"  ROUGE-1: {metrics['rouge1']:.2f}  ROUGE-2: {metrics['rouge2']:.2f}  "
+          f"ROUGE-L: {metrics['rougeL']:.2f}  (N={metrics['N']:,})")
+    return metrics
+
+
 def evaluate_split(split, tokenizer, model, device):
     print(f"\n=== {split} ===")
     ds = load_squad_json(DATA_DIR / f"{split}.json")
@@ -147,9 +201,9 @@ def evaluate_split(split, tokenizer, model, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["base", "summarization"], required=True)
+    parser.add_argument("--source", choices=["base", "summarization", "joint"], required=True)
     args = parser.parse_args()
-    condition = "baseline" if args.source == "base" else "transfer"
+    condition = {"base": "baseline", "summarization": "transfer", "joint": "joint"}[args.source]
     model_path = Path(f"outputs/model/{condition}/best")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -163,6 +217,11 @@ def main():
     for split in ["validation", "test"]:
         metrics = evaluate_split(split, tokenizer, model, device)
         results[split] = metrics
+
+    if args.source == "joint":
+        results["summary_bn"] = {}
+        for split in ["validation", "test"]:
+            results["summary_bn"][split] = evaluate_summary_split(split, tokenizer, model, device)
 
     out_file = RESULTS_DIR / f"{condition}.json"
     with open(out_file, "w", encoding="utf-8") as f:

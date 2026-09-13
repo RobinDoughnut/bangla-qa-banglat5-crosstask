@@ -36,6 +36,24 @@
       "args": ["--source", "summarization"],
       "console": "integratedTerminal",
       "python": "${workspaceFolder}/.venv/bin/python"
+    },
+    {
+      "name": "Train BanglaT5 joint (multi-task, D_S + D_Q)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/train.py",
+      "args": ["--source", "joint"],
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/bin/python"
+    },
+    {
+      "name": "Evaluate joint",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/evaluate_model.py",
+      "args": ["--source", "joint"],
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/bin/python"
     }
   ]
 }

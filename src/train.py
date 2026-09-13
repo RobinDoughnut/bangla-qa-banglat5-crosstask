@@ -1,13 +1,19 @@
 """
 Fine-tunes BanglaT5 for question answering (question + context -> answer) on squad_bn.
 
-Two init conditions, selected with --source:
-  base           start from the original csebuetnlp/banglat5 checkpoint
+Three conditions, selected with --source:
+  base           start from the original csebuetnlp/banglat5 checkpoint, QA only
   summarization  start from ../Bangla-T5-finetuned-summary (this model, already
-                 fine-tuned on Bangla summarization) -- the cross-task transfer condition
+                 fine-tuned on Bangla summarization) -- the sequential cross-task
+                 transfer condition
+  joint          start from the original csebuetnlp/banglat5 checkpoint and train on
+                 D_S (summarization, MultiBanAbs) and D_Q (QA, squad_bn) simultaneously,
+                 a single model distinguishing the two tasks purely via input prefix
+                 ("summarize: ..." vs "question: ... context: ...") -- the multi-task
+                 joint-learning baseline
 
-Same task/format/hyperparameters as bangla-qa-banglat5; the only variable
-introduced here is the initialization checkpoint.
+Same task/format/hyperparameters as bangla-qa-banglat5 and the base/summarization
+conditions above; the joint condition additionally mixes in D_S.
 """
 
 import argparse
@@ -23,14 +29,16 @@ from transformers import (
     DataCollatorForSeq2Seq,
     TrainerCallback,
 )
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
 
 BASE_MODEL = "csebuetnlp/banglat5"
 SUMMARIZATION_CHECKPOINT = Path("../Bangla-T5-finetuned-summary")
 
 DATA_DIR = Path("data/squad_bn")
+SUMMARY_DATA_DIR = Path("data/summary_bn")
 MAX_INPUT_LENGTH = 512
 MAX_TARGET_LENGTH = 64
+SUMMARY_MAX_TARGET_LENGTH = 128  # summaries (p90 ~47 words) run longer than QA answers
 BATCH_SIZE = 4
 GRAD_ACCUM_STEPS = 4  # effective batch size stays 16
 EPOCHS = 3
@@ -107,19 +115,58 @@ def tokenize(examples, tokenizer):
     return model_inputs
 
 
+def load_summary_json(path):
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    return Dataset.from_dict({
+        "id": [ex["id"] for ex in raw],
+        "article": [ex["article"] for ex in raw],
+        "summary": [ex["summary"] for ex in raw],
+    })
+
+
+def tokenize_summary(examples, tokenizer):
+    # D_S input format: task-specific prefix distinguishing it from the QA task above.
+    inputs = [f"summarize: {a}" for a in examples["article"]]
+    targets = examples["summary"]
+
+    model_inputs = tokenizer(
+        inputs,
+        max_length=MAX_INPUT_LENGTH,
+        truncation=True,
+        padding=False,
+    )
+    labels = tokenizer(
+        text_target=targets,
+        max_length=SUMMARY_MAX_TARGET_LENGTH,
+        truncation=True,
+        padding=False,
+    )
+    labels["input_ids"] = [
+        [(tok if tok != tokenizer.pad_token_id else -100) for tok in label]
+        for label in labels["input_ids"]
+    ]
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["base", "summarization"], required=True,
-                         help="base = fine-tune from csebuetnlp/banglat5; "
-                              "summarization = continue fine-tuning from the summarization checkpoint (transfer condition)")
+    parser.add_argument("--source", choices=["base", "summarization", "joint"], required=True,
+                         help="base = fine-tune from csebuetnlp/banglat5 on QA only; "
+                              "summarization = continue fine-tuning from the summarization checkpoint (sequential transfer condition); "
+                              "joint = fine-tune from csebuetnlp/banglat5 on D_S + D_Q simultaneously (multi-task joint-learning baseline)")
     args = parser.parse_args()
 
     if args.source == "base":
         model_name = BASE_MODEL
         output_dir = Path("outputs/model/baseline")
-    else:
+    elif args.source == "summarization":
         model_name = str(SUMMARIZATION_CHECKPOINT)
         output_dir = Path("outputs/model/transfer")
+    else:
+        model_name = BASE_MODEL
+        output_dir = Path("outputs/model/joint")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     save_path = output_dir / "best"
@@ -145,21 +192,46 @@ def main():
     print("Loading data...")
     train_ds = load_squad_json(DATA_DIR / "train.json")
     val_ds = load_squad_json(DATA_DIR / "validation.json")
-    print(f"  train: {len(train_ds):,}  val: {len(val_ds):,}")
+    print(f"  D_Q train: {len(train_ds):,}  D_Q val: {len(val_ds):,}")
 
     print("Tokenizing...")
     train_features = train_ds.map(
         lambda ex: tokenize(ex, tokenizer),
         batched=True,
         remove_columns=train_ds.column_names,
-        desc="train",
+        desc="train (D_Q)",
     )
     val_features = val_ds.map(
         lambda ex: tokenize(ex, tokenizer),
         batched=True,
         remove_columns=val_ds.column_names,
-        desc="val",
+        desc="val (D_Q)",
     )
+
+    if args.source == "joint":
+        summary_train_ds = load_summary_json(SUMMARY_DATA_DIR / "train.json")
+        summary_val_ds = load_summary_json(SUMMARY_DATA_DIR / "validation.json")
+        print(f"  D_S train: {len(summary_train_ds):,}  D_S val: {len(summary_val_ds):,}")
+
+        summary_train_features = summary_train_ds.map(
+            lambda ex: tokenize_summary(ex, tokenizer),
+            batched=True,
+            remove_columns=summary_train_ds.column_names,
+            desc="train (D_S)",
+        )
+        summary_val_features = summary_val_ds.map(
+            lambda ex: tokenize_summary(ex, tokenizer),
+            batched=True,
+            remove_columns=summary_val_ds.column_names,
+            desc="val (D_S)",
+        )
+
+        # Concatenate D_Q + D_S into one mixture; the Trainer's default random sampler
+        # shuffles every epoch, so tasks are interleaved throughout training, distinguished
+        # only by their input prefix ("question: ... context: ..." vs "summarize: ...").
+        train_features = concatenate_datasets([train_features, summary_train_features])
+        val_features = concatenate_datasets([val_features, summary_val_features])
+        print(f"  joint train (D_Q + D_S): {len(train_features):,}  joint val: {len(val_features):,}")
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     training_args = Seq2SeqTrainingArguments(
@@ -178,7 +250,7 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         predict_with_generate=True,
-        generation_max_length=MAX_TARGET_LENGTH,
+        generation_max_length=SUMMARY_MAX_TARGET_LENGTH if args.source == "joint" else MAX_TARGET_LENGTH,
         bf16=use_bf16,
         report_to="none",
         logging_steps=200,
