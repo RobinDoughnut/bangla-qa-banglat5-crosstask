@@ -1,7 +1,7 @@
 """
 Fine-tunes BanglaT5 for question answering (question + context -> answer) on squad_bn.
 
-Three conditions, selected with --source:
+Four conditions, selected with --source:
   base           start from the original csebuetnlp/banglat5 checkpoint, QA only
   summarization  start from ../Bangla-T5-finetuned-summary (this model, already
                  fine-tuned on Bangla summarization) -- the sequential cross-task
@@ -11,6 +11,12 @@ Three conditions, selected with --source:
                  a single model distinguishing the two tasks purely via input prefix
                  ("summarize: ..." vs "question: ... context: ...") -- the multi-task
                  joint-learning baseline
+  base_untied    ablation: same as base (original pretrained checkpoint, D_Q only,
+                 no cross-task exposure), but with tie_word_embeddings=False set
+                 before training so the model has the same untied-embedding parameter
+                 count as `summarization` (296.9M vs 247.6M). Isolates whether the
+                 `summarization` condition's gain over `base` comes from cross-task
+                 transfer or merely from having more parameters.
 
 Same task/format/hyperparameters as bangla-qa-banglat5 and the base/summarization
 conditions above; the joint condition additionally mixes in D_S.
@@ -152,10 +158,11 @@ def tokenize_summary(examples, tokenizer):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["base", "summarization", "joint"], required=True,
+    parser.add_argument("--source", choices=["base", "summarization", "joint", "base_untied"], required=True,
                          help="base = fine-tune from csebuetnlp/banglat5 on QA only; "
                               "summarization = continue fine-tuning from the summarization checkpoint (sequential transfer condition); "
-                              "joint = fine-tune from csebuetnlp/banglat5 on D_S + D_Q simultaneously (multi-task joint-learning baseline)")
+                              "joint = fine-tune from csebuetnlp/banglat5 on D_S + D_Q simultaneously (multi-task joint-learning baseline); "
+                              "base_untied = same as base but with tie_word_embeddings=False (parameter-count ablation vs. summarization)")
     args = parser.parse_args()
 
     if args.source == "base":
@@ -164,6 +171,9 @@ def main():
     elif args.source == "summarization":
         model_name = str(SUMMARIZATION_CHECKPOINT)
         output_dir = Path("outputs/model/transfer")
+    elif args.source == "base_untied":
+        model_name = BASE_MODEL
+        output_dir = Path("outputs/model/baseline_untied")
     else:
         model_name = BASE_MODEL
         output_dir = Path("outputs/model/joint")
@@ -184,7 +194,18 @@ def main():
         print(f"Found {len(existing_checkpoints)} existing checkpoint(s) -- resuming from the latest.")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    if args.source == "base_untied":
+        # tie_word_embeddings must be passed at load time, not set on model.config
+        # after from_pretrained() returns: this checkpoint's on-disk shared.weight and
+        # lm_head.weight already differ, so recent transformers versions refuse to
+        # (re-)tie them at load time regardless of the config value found afterwards --
+        # setting the flag post-hoc is a no-op here and silently reproduces `base`
+        # instead of the parameter-matched ablation. Passing it into from_pretrained
+        # forces genuinely independent encoder/decoder/lm_head embedding matrices,
+        # matching the `summarization` checkpoint's 296.9M-parameter untied structure.
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, tie_word_embeddings=False)
+    else:
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
     print("Model stats:")
     print_model_stats(model)

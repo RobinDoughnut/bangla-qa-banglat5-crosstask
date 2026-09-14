@@ -1,19 +1,30 @@
 """
-Prints a baseline-vs-transfer-vs-joint comparison table from
-outputs/results/{baseline,transfer,joint}.json. `joint` is optional -- the table
-still prints baseline-vs-transfer if it's missing.
+Prints a baseline-vs-transfer-vs-joint-vs-baseline_untied comparison table from
+outputs/results/{baseline,transfer,joint,baseline_untied}.json. `joint` and
+`baseline_untied` are optional -- the table adapts to whichever result files exist.
+
+`baseline_untied` is the parameter-count ablation: same init/data as `baseline`
+(no cross-task exposure) but with tie_word_embeddings=False, matching `transfer`'s
+296.9M-parameter (untied-embedding) size. Reading its delta vs. baseline separates
+the `transfer` gain into a parameter-count component and a cross-task-transfer
+component:
+  baseline_untied ~= baseline   -> transfer's gain is real cross-task transfer
+  baseline_untied ~= transfer   -> transfer's gain was mostly extra parameters
 """
 
 import json
 from pathlib import Path
 
 RESULTS_DIR = Path("outputs/results")
-SOURCE_FLAG = {"baseline": "base", "transfer": "summarization", "joint": "joint"}
+SOURCE_FLAG = {"baseline": "base", "transfer": "summarization", "joint": "joint",
+               "baseline_untied": "base_untied"}
+REQUIRED = ["baseline", "transfer"]
+OPTIONAL = ["baseline_untied", "joint"]
 
 
 def main():
     results = {}
-    for condition in ["baseline", "transfer"]:
+    for condition in REQUIRED:
         path = RESULTS_DIR / f"{condition}.json"
         if not path.exists():
             print(f"Missing {path} -- run evaluate_model.py --source {SOURCE_FLAG[condition]} first")
@@ -21,27 +32,40 @@ def main():
         with open(path, encoding="utf-8") as f:
             results[condition] = json.load(f)
 
-    joint_path = RESULTS_DIR / "joint.json"
-    have_joint = joint_path.exists()
-    if have_joint:
-        with open(joint_path, encoding="utf-8") as f:
-            results["joint"] = json.load(f)
+    present_optional = []
+    for condition in OPTIONAL:
+        path = RESULTS_DIR / f"{condition}.json"
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                results[condition] = json.load(f)
+            present_optional.append(condition)
 
-    conditions = ["baseline", "transfer", "joint"] if have_joint else ["baseline", "transfer"]
+    # Fixed display order regardless of which optional conditions are present.
+    conditions = ["baseline", "baseline_untied", "transfer", "joint"]
+    conditions = [c for c in conditions if c in results]
 
     for split in ["validation", "test"]:
         print(f"\n=== {split} (QA, D_Q) ===")
-        header = f"{'metric':<15}" + "".join(f"{c:>12}" for c in conditions)
-        if not have_joint:
-            header += f"{'delta':>12}"
+        header = f"{'metric':<15}" + "".join(f"{c:>16}" for c in conditions)
+        header += f"{'d(vs baseline)':>16}" * (len(conditions) - 1)
         print(header)
         for metric in ["EM", "F1", "BERTScore-F1"]:
-            row = f"{metric:<15}" + "".join(f"{results[c][split][metric]:>12.2f}" for c in conditions)
-            if not have_joint:
-                row += f"{results['transfer'][split][metric] - results['baseline'][split][metric]:>+12.2f}"
+            row = f"{metric:<15}" + "".join(f"{results[c][split][metric]:>16.2f}" for c in conditions)
+            for c in conditions[1:]:
+                row += f"{results[c][split][metric] - results['baseline'][split][metric]:>+16.2f}"
             print(row)
 
-    if have_joint and "summary_bn" in results["joint"]:
+    if "baseline_untied" in results:
+        for split in ["validation", "test"]:
+            print(f"\n=== {split}: parameter-count vs. cross-task-transfer decomposition ===")
+            for metric in ["EM", "F1", "BERTScore-F1"]:
+                total = results["transfer"][split][metric] - results["baseline"][split][metric]
+                param_effect = results["baseline_untied"][split][metric] - results["baseline"][split][metric]
+                transfer_effect = results["transfer"][split][metric] - results["baseline_untied"][split][metric]
+                print(f"  {metric:<13} total(transfer-baseline)={total:+.2f}  "
+                      f"parameter-count={param_effect:+.2f}  cross-task-transfer={transfer_effect:+.2f}")
+
+    if "joint" in results and "summary_bn" in results["joint"]:
         for split in ["validation", "test"]:
             print(f"\n=== {split} (Summarization, D_S -- joint condition only) ===")
             metrics = results["joint"]["summary_bn"][split]

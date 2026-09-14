@@ -9,6 +9,7 @@ Usage:
   python src/evaluate_model.py --source base
   python src/evaluate_model.py --source summarization
   python src/evaluate_model.py --source joint
+  python src/evaluate_model.py --source base_untied
 """
 
 import argparse
@@ -201,9 +202,10 @@ def evaluate_split(split, tokenizer, model, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["base", "summarization", "joint"], required=True)
+    parser.add_argument("--source", choices=["base", "summarization", "joint", "base_untied"], required=True)
     args = parser.parse_args()
-    condition = {"base": "baseline", "summarization": "transfer", "joint": "joint"}[args.source]
+    condition = {"base": "baseline", "summarization": "transfer", "joint": "joint",
+                 "base_untied": "baseline_untied"}[args.source]
     model_path = Path(f"outputs/model/{condition}/best")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
