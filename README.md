@@ -37,6 +37,7 @@ the other conditions.
 | [bangla-qa-mt5-crosstask](../bangla-qa-mt5-crosstask) | mT5-small | Same design, mT5 backbone |
 | [bangla-qa-banglat5](../bangla-qa-banglat5) | BanglaT5 | Original QA repo, pretrained-only, this repo's "baseline" condition reproduces it |
 | [bangla-qg-banglat5](../bangla-qg-banglat5) | BanglaT5 | Same baseline/transfer design, applied to question generation instead |
+| [bangla-qa-banglat5-lora](../bangla-qa-banglat5-lora) | BanglaT5, frozen + LoRA | Different question from this repo's ablations: with the backbone entirely frozen (same 296.9M-param untied checkpoint), how much of `baseline`/`joint`'s performance does a 0.30%-parameter LoRA adapter recover, trained separately per task? |
 
 This repo exists because the original request (fine-tune the summarization checkpoints on a
 downstream task, and measure cross-task transfer) was initially misread as "question generation."
