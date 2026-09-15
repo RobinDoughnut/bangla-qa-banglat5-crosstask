@@ -2,16 +2,17 @@
 
 Fine-tunes [`csebuetnlp/banglat5`](https://huggingface.co/csebuetnlp/banglat5) for extractive
 question answering (question + context -> answer) on Bangla SQuAD
-([csebuetnlp/squad_bn](https://huggingface.co/datasets/csebuetnlp/squad_bn)), under four
+([csebuetnlp/squad_bn](https://huggingface.co/datasets/csebuetnlp/squad_bn)), under five
 conditions, to test whether -- and how -- cross-task exposure to a different task (Bangla
 summarization) interacts with QA: not at all (baseline), sequentially (transfer), simultaneously
-(joint), and a parameter-count-matched ablation of transfer (baseline_untied) that isolates
-whether transfer's gain over baseline is cross-task learning or just extra parameters.
+(joint), and parameter-count-matched ablations of both transfer (baseline_untied) and joint
+(joint_untied) that isolate whether each condition's gain/regression over baseline is a cross-task
+or multi-task effect or just extra parameters.
 
 ## Research question
 
 Does exposure to Bangla summarization help a model learn question answering, and does *how* that
-exposure happens (before QA training vs. simultaneously with it) matter? Four conditions, identical
+exposure happens (before QA training vs. simultaneously with it) matter? Five conditions, identical
 QA data/hyperparameters, differing in whether/how summarization data (D_S) enters training and in
 embedding tying:
 
@@ -21,6 +22,7 @@ embedding tying:
 | **baseline_untied** | `csebuetnlp/banglat5` (original pretrained) | D_Q only | untied (296.9M params) | Ablation: ties `transfer`'s parameter count to `baseline`'s init/data, with no cross-task exposure -- isolates whether `transfer`'s gain is cross-task learning or just more parameters |
 | **transfer** | `../Bangla-T5-finetuned-summary` (already fine-tuned on Bangla summarization) | D_Q only | untied (296.9M params, inherited from the summarization checkpoint) | QA fine-tuned on top of a *different*, already-completed downstream task (sequential transfer) |
 | **joint** | `csebuetnlp/banglat5` (original pretrained) | D_S + D_Q simultaneously | tied (247.6M params) | Multi-task joint learning: a single model trained on both tasks at once, distinguished only by input prefix (`"question: ..."` vs `"summarize: ..."`) |
+| **joint_untied** | `csebuetnlp/banglat5` (original pretrained) | D_S + D_Q simultaneously | untied (296.9M params) | Ablation: ties `joint`'s parameter count to `baseline_untied`/`transfer`'s, with the same D_S+D_Q multi-task training as `joint` -- isolates whether `joint`'s QA regression vs. baseline is affected by embedding capacity |
 
 D_S is [MultiBanAbs](https://arxiv.org/abs/2511.19317) (A Comprehensive Multi-Domain Bangla
 Abstractive Text Summarization Dataset), supplied locally (54,620 examples; not from HuggingFace --
@@ -171,27 +173,29 @@ python src/train.py --source base            # baseline condition
 python src/train.py --source summarization   # transfer condition
 python src/train.py --source joint            # joint (multi-task) condition
 python src/train.py --source base_untied      # baseline_untied ablation condition
+python src/train.py --source joint_untied     # joint_untied ablation condition
 ```
 
-Saves to `outputs/model/{baseline,transfer,joint,baseline_untied}/best`. Safe to interrupt and
-re-run: a condition whose `best/` checkpoint already exists is skipped, and an in-progress
-condition resumes from its latest epoch checkpoint rather than restarting.
+Saves to `outputs/model/{baseline,transfer,joint,baseline_untied,joint_untied}/best`. Safe to
+interrupt and re-run: a condition whose `best/` checkpoint already exists is skipped, and an
+in-progress condition resumes from its latest epoch checkpoint rather than restarting.
 
-**`base_untied` implementation note:** `tie_word_embeddings=False` must be passed into
-`AutoModelForSeq2SeqLM.from_pretrained(...)` itself, not set on `model.config` after the call
+**`base_untied`/`joint_untied` implementation note:** `tie_word_embeddings=False` must be passed
+into `AutoModelForSeq2SeqLM.from_pretrained(...)` itself, not set on `model.config` after the call
 returns. On the `transformers` version this repo was verified against (5.12.1), the pretrained
 `csebuetnlp/banglat5` checkpoint already stores `shared.weight` and `lm_head.weight` as two
 distinct on-disk tensors with different values; the loader detects that mismatch and refuses to
 (re-)tie them at load time regardless of what the config says, before or after loading. Setting the
-flag post-hoc is therefore a no-op that silently reproduces `baseline` instead of a
+flag post-hoc is therefore a no-op that silently reproduces `baseline`/`joint` instead of a
 parameter-matched ablation -- confirmed empirically: both approaches gave `shared.weight ==
 lm_head.weight` (False, distinct objects) and the same 247,577,856-param total either way, until
 the flag was passed at construction time, which produces 296,926,464 params (matching `transfer`
-exactly) via genuinely independent encoder-embedding/decoder-embedding/lm_head matrices.
+exactly) via genuinely independent encoder-embedding/decoder-embedding/lm_head matrices. Confirmed
+again for `joint_untied` at the end of its training run (see Model stats below).
 
-**Hyperparameters** (identical across all four conditions, and identical to
+**Hyperparameters** (identical across all five conditions, and identical to
 `bangla-qa-banglat5` -- baseline/baseline_untied/transfer vary only the init checkpoint and
-embedding tying; joint additionally mixes in D_S):
+embedding tying; joint/joint_untied additionally mix in D_S):
 
 | Parameter | Value |
 |-----------|-------|
@@ -204,13 +208,14 @@ embedding tying; joint additionally mixes in D_S):
 | Optimizer | Adafactor |
 | Mixed precision | bf16 |
 
-**How `joint` mixes D_S and D_Q:** both datasets are tokenized independently (each with its own
-prefix and target-length cap), then concatenated into a single `Dataset` before training --
-`121,294` examples total (68,674 D_Q + 52,620 D_S). No custom sampler or interleaving schedule: the
-`Trainer`'s default per-epoch random shuffle mixes the two tasks throughout training on its own,
-and the model sees each task's full data once per epoch, same as it would see D_Q alone in
-`baseline`. The two tasks are distinguished purely by input prefix -- there's no auxiliary loss
-weighting, task embedding, or architecture change.
+**How `joint`/`joint_untied` mix D_S and D_Q:** both datasets are tokenized independently (each with
+its own prefix and target-length cap), then concatenated into a single `Dataset` before training --
+`121,294` examples total (68,674 D_Q + 52,620 D_S), identically for both conditions. No custom
+sampler or interleaving schedule: the `Trainer`'s default per-epoch random shuffle mixes the two
+tasks throughout training on its own, and the model sees each task's full data once per epoch, same
+as it would see D_Q alone in `baseline`. The two tasks are distinguished purely by input prefix --
+there's no auxiliary loss weighting, task embedding, or architecture change. `joint_untied` differs
+from `joint` only in `tie_word_embeddings=False` at load time (see implementation note above).
 
 ## Evaluation
 
@@ -219,12 +224,14 @@ python src/evaluate_model.py --source base
 python src/evaluate_model.py --source summarization
 python src/evaluate_model.py --source joint
 python src/evaluate_model.py --source base_untied
+python src/evaluate_model.py --source joint_untied
 python src/compare_results.py
 ```
 
 **Metrics:** EM, F1, and BERTScore-F1 (`bert-base-multilingual-cased`) on D_Q -- identical to
-`bangla-qa-banglat5`, computed the same way for all four conditions. For `joint`, also ROUGE-1/2/L
-on D_S (`rouge-score`, no stemming) since that's the only condition that learns summarization.
+`bangla-qa-banglat5`, computed the same way for all five conditions. For `joint`/`joint_untied`,
+also ROUGE-1/2/L on D_S (`rouge-score`, no stemming) since those are the only conditions that learn
+summarization.
 Note: `rouge-score`'s default tokenizer only matches ASCII `[a-z0-9]+` and silently produces 0 for
 non-Latin scripts; `evaluate_model.py` uses a plain whitespace tokenizer instead so Bangla text
 scores correctly.
@@ -233,20 +240,20 @@ scores correctly.
 
 **Model stats:**
 
-| | baseline | baseline_untied | transfer | joint |
-|---|---|---|---|---|
-| Init checkpoint | `csebuetnlp/banglat5` | `csebuetnlp/banglat5` | `Bangla-T5-finetuned-summary` | `csebuetnlp/banglat5` |
-| Training data | D_Q (68,674) | D_Q (68,674) | D_Q (68,674) | D_S + D_Q (121,294) |
-| Total params | 247,577,856 | 296,926,464 | 296,926,464 | 247,577,856 |
-| Model size (fp32) | 944.4 MB | 1132.7 MB | 1132.7 MB | 944.4 MB |
+| | baseline | baseline_untied | transfer | joint | joint_untied |
+|---|---|---|---|---|---|
+| Init checkpoint | `csebuetnlp/banglat5` | `csebuetnlp/banglat5` | `Bangla-T5-finetuned-summary` | `csebuetnlp/banglat5` | `csebuetnlp/banglat5` |
+| Training data | D_Q (68,674) | D_Q (68,674) | D_Q (68,674) | D_S + D_Q (121,294) | D_S + D_Q (121,294) |
+| Total params | 247,577,856 | 296,926,464 | 296,926,464 | 247,577,856 | 296,926,464 |
+| Model size (fp32) | 944.4 MB | 1132.7 MB | 1132.7 MB | 944.4 MB | 1132.7 MB |
 
 **Training** (RTX 4070, effective batch size 16):
 
-| Epoch | baseline eval_loss | baseline time | baseline_untied eval_loss | baseline_untied time | transfer eval_loss | transfer time | joint eval_loss | joint time |
-|-------|---------------------|----------------|----------------------------|------------------------|----------------------|-----------------|-------------------|-------------|
-| 1 | 0.9947 | 30.8 min | 0.999 | 31.2 min | 0.6900 | 30.8 min | 2.422 | 67.5 min |
-| 2 | 0.8127 | 30.8 min | 0.8267 | 32.2 min | 0.6681 | 30.9 min | 1.694 | 69.2 min |
-| 3 | 0.7953 | 30.8 min | 0.8063 | 31.2 min | 0.6685 | 30.6 min | 1.647 | 67.4 min |
+| Epoch | baseline eval_loss | baseline time | baseline_untied eval_loss | baseline_untied time | transfer eval_loss | transfer time | joint eval_loss | joint time | joint_untied eval_loss | joint_untied time |
+|-------|---------------------|----------------|----------------------------|------------------------|----------------------|-----------------|-------------------|-------------|--------------------------|---------------------|
+| 1 | 0.9947 | 30.8 min | 0.999 | 31.2 min | 0.6900 | 30.8 min | 2.422 | 67.5 min | 1.959 | 68.8 min |
+| 2 | 0.8127 | 30.8 min | 0.8267 | 32.2 min | 0.6681 | 30.9 min | 1.694 | 69.2 min | 1.662 | 69.3 min |
+| 3 | 0.7953 | 30.8 min | 0.8063 | 31.2 min | 0.6685 | 30.6 min | 1.647 | 67.4 min | 1.618 | 69.6 min |
 
 The baseline condition's loss here (epoch 3: 0.7953) is close to, but not identical to, the
 original `bangla-qa-banglat5` repo's own run (epoch 3: 0.8003) -- expected run-to-run variance from
@@ -257,12 +264,18 @@ they're a small fraction of the ~198M non-embedding backbone, so it doesn't mate
 training cost. It does **not** track `transfer`'s much lower loss (epoch 3: 0.6685), which is the
 first sign that `transfer`'s advantage isn't coming from having more parameters.
 
-**`joint`'s eval_loss is not comparable to baseline/transfer's.** It's averaged over the
-concatenated D_Q + D_S validation set (2,251 examples: 1,251 QA + 1,000 summarization), a
+**`joint`/`joint_untied`'s eval_loss is not comparable to baseline/transfer's.** It's averaged over
+the concatenated D_Q + D_S validation set (2,251 examples: 1,251 QA + 1,000 summarization), a
 fundamentally harder/longer generation task mixed in -- the higher absolute numbers say nothing
-about QA quality on their own; see the EM/F1/BERTScore table below for that. `joint` also takes
-~2.2x longer per epoch than baseline/transfer, tracking its ~1.77x larger combined training set
-(121,294 vs 68,674 examples) plus the longer 128-token generation cap during eval.
+about QA quality on their own; see the EM/F1/BERTScore table below for that. Both take ~2.2x longer
+per epoch than baseline/transfer, tracking their ~1.77x larger combined training set (121,294 vs
+68,674 examples) plus the longer 128-token generation cap during eval; `joint_untied`'s extra ~49M
+untied-embedding parameters don't measurably change that per-epoch cost (69.6 min vs. `joint`'s 67.4
+min at epoch 3, within the same noise band as `baseline_untied` vs. `baseline`).
+`joint_untied` tracks consistently *lower* eval_loss than `joint` at every epoch (epoch 3: 1.618 vs.
+1.647) -- unlike `baseline_untied`, which barely moved off `baseline`. The extra embedding capacity
+appears to help more when there's a second task's vocabulary/style to also fit, though this loss gap
+does not translate cleanly into better QA metrics (see the embedding-capacity ablation below).
 
 **Evaluation (QA, D_Q):**
 
@@ -272,16 +285,18 @@ about QA quality on their own; see the EM/F1/BERTScore table below for that. `jo
 | Validation | baseline_untied | 55.16 | 68.66 | 91.25 | 1,251 |
 | Validation | transfer | 57.07 | 70.24 | 91.76 | 1,251 |
 | Validation | joint | 52.76 | 66.93 | 90.90 | 1,251 |
+| Validation | joint_untied | 53.72 | 67.99 | 91.19 | 1,251 |
 | Test | baseline | 53.27 | 68.05 | 91.16 | 1,252 |
 | Test | baseline_untied | 53.35 | 68.27 | 91.21 | 1,252 |
 | Test | transfer | 54.55 | 69.34 | 91.60 | 1,252 |
 | Test | joint | 52.64 | 67.29 | 90.95 | 1,252 |
+| Test | joint_untied | 52.24 | 67.33 | 90.95 | 1,252 |
 
-| Test metric | baseline | transfer | joint | joint vs. baseline | joint vs. transfer |
-|---|---|---|---|---|---|
-| EM | 53.27 | 54.55 | 52.64 | -0.63 | -1.91 |
-| F1 | 68.05 | 69.34 | 67.29 | -0.76 | -2.05 |
-| BERTScore-F1 | 91.16 | 91.60 | 90.95 | -0.21 | -0.65 |
+| Test metric | baseline | transfer | joint | joint_untied | joint vs. baseline | joint_untied vs. baseline | joint vs. transfer | joint_untied vs. transfer |
+|---|---|---|---|---|---|---|---|---|
+| EM | 53.27 | 54.55 | 52.64 | 52.24 | -0.63 | -1.04 | -1.91 | -2.31 |
+| F1 | 68.05 | 69.34 | 67.29 | 67.33 | -0.76 | -0.72 | -2.05 | -2.01 |
+| BERTScore-F1 | 91.16 | 91.60 | 90.95 | 90.95 | -0.21 | -0.22 | -0.65 | -0.65 |
 
 ### Ablation: is transfer's gain from cross-task learning or from parameter count?
 
@@ -309,33 +324,72 @@ shows up once that capacity is actually *used* by prior fine-tuning on a related
 This also explains `baseline_untied`'s training-loss curve (Training, above) tracking `baseline`
 rather than `transfer`: more parameters alone don't get you to `transfer`'s lower loss.
 
-**Evaluation (Summarization, D_S -- `joint` only):**
+### Ablation: does embedding capacity explain joint's QA regression?
 
-| Split | ROUGE-1 | ROUGE-2 | ROUGE-L | N |
-|-------|---------|---------|---------|-----|
-| Validation | 21.41 | 9.26 | 18.74 | 1,000 |
-| Test | 21.83 | 9.64 | 18.95 | 1,000 |
+`joint` scores below `baseline` on every QA metric, but it's also the only condition trained with
+tied (247.6M-param) embeddings while simultaneously absorbing a second task -- the opposite pairing
+from `transfer`, which gets *more* capacity *and* single-task specialization. `joint_untied` isolates
+the capacity variable by holding `joint`'s D_S+D_Q multi-task training fixed and only untying the
+embeddings (296,926,464 params, matching `baseline_untied`/`transfer`):
 
-Manual inspection of `joint`'s D_S generations (see `outputs/logs/evaluate_joint.log` / re-run
-`evaluate_model.py --source joint` to reproduce) shows fluent, on-topic Bangla summaries that
-capture the article's main point, even where they don't lexically match the reference closely
-enough to score high on ROUGE -- e.g. paraphrasing "গুড়ে ভেজাল" as "পচা চিনির রস দিয়ে গুড় তৈরির
-অভিযোগ", correct in meaning but different wording. ROUGE-1/2/L, being surface n-gram overlap
-metrics, systematically undercount abstractive paraphrasing like this.
+| Test metric | joint | joint_untied | delta (joint_untied − joint) |
+|---|---|---|---|
+| EM | 52.64 | 52.24 | -0.40 |
+| F1 | 67.29 | 67.33 | +0.04 |
+| BERTScore-F1 | 90.95 | 90.95 | -0.01 |
 
-**Finding:** the three conditions trace out the expected multi-task trade-off curve.
-**Sequential transfer** (summarization-then-QA) is the best QA performer of the three -- prior
+Validation moves the other way (EM +0.96, F1 +1.06, BERTScore-F1 +0.28) -- the sign flips between
+splits, unlike `baseline_untied`'s small-but-consistent edge over `baseline` on both splits.
+
+**Finding: unlike `transfer`'s gain, embedding capacity has no reliable effect on `joint`'s QA
+regression.** All three test deltas are within noise (largest ±0.40 EM, on a 1,252-example test set
+that's roughly 5 questions), and the validation/test sign flip on EM is itself evidence the "effect"
+isn't real. This is a different outcome from the `baseline`/`baseline_untied`/`transfer` decomposition
+above, where extra capacity contributed a small-but-consistent gain layered under a much larger
+transfer effect -- here, extra capacity contributes nothing detectable either way. `joint`'s QA
+regression looks like a genuine multi-task capacity-competition effect (shared parameters splitting
+attention between two simultaneous objectives), not something more embedding room alone fixes;
+consistent with `joint_untied` tracking a lower *training* loss than `joint` (Training, above) while
+its QA *metrics* don't reliably improve -- the extra capacity helps the model fit both tasks' losses
+a bit better on average without that translating into better QA generation specifically.
+
+**Evaluation (Summarization, D_S):**
+
+| Split | Condition | ROUGE-1 | ROUGE-2 | ROUGE-L | N |
+|-------|-----------|---------|---------|---------|-----|
+| Validation | joint | 21.41 | 9.26 | 18.74 | 1,000 |
+| Validation | joint_untied | 21.20 | 9.14 | 18.52 | 1,000 |
+| Test | joint | 21.83 | 9.64 | 18.95 | 1,000 |
+| Test | joint_untied | 21.96 | 9.81 | 19.31 | 1,000 |
+
+`joint_untied`'s summarization quality is statistically indistinguishable from `joint`'s (differences
+≤0.4 ROUGE-L either direction across splits) -- another point in the "no reliable capacity effect"
+finding above, this time on the task `joint`/`joint_untied` were actually trained to gain.
+
+Manual inspection of the D_S generations (see `outputs/logs/evaluate_joint.log` /
+`outputs/logs/evaluate_joint_untied.log`, or re-run `evaluate_model.py --source joint` /
+`--source joint_untied` to reproduce) shows fluent, on-topic Bangla summaries that capture the
+article's main point, even where they don't lexically match the reference closely enough to score
+high on ROUGE -- e.g. paraphrasing "গুড়ে ভেজাল" as "পচা চিনির রস দিয়ে গুড় তৈরির অভিযোগ", correct in
+meaning but different wording. ROUGE-1/2/L, being surface n-gram overlap metrics, systematically
+undercount abstractive paraphrasing like this.
+
+**Finding:** the five conditions trace out the expected multi-task trade-off curve.
+**Sequential transfer** (summarization-then-QA) is the best QA performer of the five -- prior
 summarization fine-tuning transfers positively to question answering (+1.28 EM / +1.29 F1 over
 baseline), matching the direction of the finding in
 [bangla-qg-banglat5](../bangla-qg-banglat5) (summarization -> QG also transferred positively).
-**Joint multi-task training**, in contrast, is the *worst* QA performer of the three (-0.63 EM vs.
-baseline, -1.91 EM vs. transfer) -- but it's the only condition that also produces a model
+**Joint multi-task training**, in contrast, is the *worst* QA performer of the five (-0.63 EM vs.
+baseline, -1.91 EM vs. transfer on `joint`; -1.04 EM vs. baseline, -2.31 EM vs. transfer on
+`joint_untied`) -- but `joint`/`joint_untied` are the only conditions that also produce a model
 genuinely capable of summarization (ROUGE-L ~19, fluent generations) from a single training run.
 This is the standard single-model-capacity cost of joint multi-task learning: splitting gradient
 updates and shared parameters across two objectives at once trades a bit of peak single-task
 performance for one model that does both, whereas sequential transfer gets to fully specialize on
 QA in a dedicated final phase after benefiting from whatever general-purpose fluency the
-summarization phase installed.
+summarization phase installed. Giving `joint` more embedding capacity (`joint_untied`) does not
+narrow this gap -- confirming the joint-training trade-off is about splitting a fixed backbone
+across two simultaneous objectives, not about running out of embedding room.
 
 ## Limitations
 
@@ -343,11 +397,13 @@ summarization phase installed.
 +1.29 F1 (transfer) and -0.63 EM / -0.76 F1 (joint) gaps vs. baseline are point estimates; on a
 1,252-example test set +1.28 EM corresponds to roughly 16 questions, noticeably larger than the
 kind of single-question noise the original `bangla-qa-banglat5` repo flagged when comparing against
-mBERT (0.95 EM, ~12 questions), but none of the four conditions is backed by a multi-seed variance
+mBERT (0.95 EM, ~12 questions), but none of the five conditions is backed by a multi-seed variance
 estimate. This applies to the `baseline_untied` ablation too: its +0.08 EM / +0.22 F1 edge over
 `baseline` is a single point estimate (roughly 1 test question for EM) -- consistent with "no real
 parameter-count effect," but not distinguishable from a genuinely tiny effect without repeated
-seeds.
+seeds. The `joint_untied` ablation is the most exposed to this: its EM delta vs. `joint` flips sign
+between validation (+0.96) and test (-0.40), a single-run artifact that would need repeated seeds to
+resolve into a real "no effect" finding rather than a coincidentally-noisy one.
 
 **The two init checkpoints are not perfectly matched.** The summarization checkpoint has untied
 embeddings (see Results); its own training data, epoch budget, and hyperparameters (from when it
@@ -357,7 +413,7 @@ Ablation, above) but not the rest -- e.g. the summarization checkpoint's own wei
 untied, still encode 54,620 examples of prior summarization gradient updates that `baseline_untied`
 never sees.
 
-**Fixed 3-epoch budget**, held constant across all four conditions to isolate the training-regime
+**Fixed 3-epoch budget**, held constant across all five conditions to isolate the training-regime
 variable. The transfer condition's eval loss is nearly flat after epoch 2 (0.6681 -> 0.6685),
 suggesting it converges faster than 3 epochs actually requires, while the baseline was still
 improving at epoch 3. `baseline_untied`'s eval loss was also still falling at epoch 3 (0.8267 ->
@@ -365,40 +421,44 @@ improving at epoch 3. `baseline_untied`'s eval loss was also still falling at ep
 plateau. `joint`'s eval_loss was also still falling at epoch 3 (2.422 -> 1.694 ->
 1.647) with the steepest drop between epochs 1-2 -- plausible given it has ~1.77x more data to get
 through per epoch than baseline/transfer, so at a fixed 3-epoch budget it simply sees each example
-fewer effective "model-updates from convergence" than the single-task conditions do.
+fewer effective "model-updates from convergence" than the single-task conditions do. `joint_untied`
+tracks the same still-falling pattern (1.959 -> 1.662 -> 1.618) at consistently lower absolute
+values than `joint`, as noted in Training above.
 
-**`baseline_untied`'s extra parameters start as copies of the pretrained checkpoint's embedding
-values, not random initialization.** Untying via `tie_word_embeddings=False` at load time gives
-`shared` (encoder+decoder input embedding), and `lm_head` four independent copies of the
+**`baseline_untied`/`joint_untied`'s extra parameters start as copies of the pretrained checkpoint's
+embedding values, not random initialization.** Untying via `tie_word_embeddings=False` at load time
+gives `shared` (encoder+decoder input embedding), and `lm_head` four independent copies of the
 pretrained checkpoint's embedding values at step 0 (not randomly-initialized matrices) -- they only
-diverge from each other as QA fine-tuning proceeds. Verified directly against the trained
+diverge from each other as fine-tuning proceeds. Verified directly against the trained
 checkpoint's raw `model.safetensors` (not just the loader's tie-reconciliation logic, which can be
-misleading -- see the `base_untied` implementation note under Training): `shared.weight`,
-`encoder.embed_tokens.weight`, `decoder.embed_tokens.weight`, and `lm_head.weight` are four
-pairwise-distinct tensors on disk after training, confirming they genuinely trained as independent
-parameters rather than silently aliasing the same memory. This is the correct control for isolating
-"does more capacity alone help": `baseline_untied` starts from *pretrained* (not random) embedding
-values in every copy, same as `transfer` does; the difference under test is purely whether those
-extra copies arrive already shaped by summarization fine-tuning (`transfer`) or not
-(`baseline_untied`).
+misleading -- see the `base_untied`/`joint_untied` implementation note under Training):
+`shared.weight`, `encoder.embed_tokens.weight`, `decoder.embed_tokens.weight`, and `lm_head.weight`
+are four pairwise-distinct tensors on disk after training, confirming they genuinely trained as
+independent parameters rather than silently aliasing the same memory. This is the correct control
+for isolating "does more capacity alone help": `baseline_untied`/`joint_untied` start from
+*pretrained* (not random) embedding values in every copy, same as `transfer` does; the difference
+under test is purely whether those extra copies arrive already shaped by summarization fine-tuning
+(`transfer`) or not (`baseline_untied`, `joint_untied`).
 
-**`joint`'s D_Q and D_S are not a matched pair.** Unlike baseline vs. transfer (which hold D_Q and
-hyperparameters fixed and vary only the init checkpoint), `joint` introduces an entirely different,
-non-HuggingFace summarization corpus (MultiBanAbs) whose own collection methodology, domain
-(Bangla news), and quality are outside this repo's control. The QA regression under `joint` could
-be attributable to genuine multi-task capacity competition, to D_S's characteristics specifically
-(e.g. news-domain text differing from squad_bn's Wikipedia-style contexts), or some mix of both --
-this repo can't distinguish those without a second D_S source to compare against.
+**`joint`/`joint_untied`'s D_Q and D_S are not a matched pair.** Unlike baseline vs. transfer (which
+hold D_Q and hyperparameters fixed and vary only the init checkpoint), `joint`/`joint_untied`
+introduce an entirely different, non-HuggingFace summarization corpus (MultiBanAbs) whose own
+collection methodology, domain (Bangla news), and quality are outside this repo's control. The QA
+regression under `joint`/`joint_untied` could be attributable to genuine multi-task capacity
+competition, to D_S's characteristics specifically (e.g. news-domain text differing from
+squad_bn's Wikipedia-style contexts), or some mix of both -- this repo can't distinguish those
+without a second D_S source to compare against.
 
-**No mixing-ratio sweep.** `joint` uses simple full-concatenation (D_S and D_Q each seen once per
-epoch, no up/downsampling or temperature-based mixing) since the two datasets were already close in
-size (52,620 vs. 68,674 train examples). A true multi-task learning study would typically sweep the
-D_S:D_Q ratio to characterize the capacity-tradeoff curve rather than reporting one point on it.
+**No mixing-ratio sweep.** `joint`/`joint_untied` use simple full-concatenation (D_S and D_Q each
+seen once per epoch, no up/downsampling or temperature-based mixing) since the two datasets were
+already close in size (52,620 vs. 68,674 train examples). A true multi-task learning study would
+typically sweep the D_S:D_Q ratio to characterize the capacity-tradeoff curve rather than reporting
+one point on it.
 
-**ROUGE undercounts abstractive correctness.** As noted in Results, `joint`'s D_S ROUGE scores
-(surface n-gram overlap) likely understate its actual summarization quality where generations
-paraphrase the reference rather than matching it lexically -- no human evaluation or a semantic
-metric (e.g. BERTScore, as used for QA above) was run on the D_S outputs.
+**ROUGE undercounts abstractive correctness.** As noted in Results, `joint`/`joint_untied`'s D_S
+ROUGE scores (surface n-gram overlap) likely understate their actual summarization quality where
+generations paraphrase the reference rather than matching it lexically -- no human evaluation or a
+semantic metric (e.g. BERTScore, as used for QA above) was run on the D_S outputs.
 
 **Dataset caveat.** Shared with the sibling `bangla-qa-*` repos: a subset of `squad_bn`'s
 `answer_start` offsets are off by 1-5 characters in validation/test. Irrelevant here since this
@@ -418,16 +478,17 @@ bangla-qa-banglat5-crosstask/
 │   │   ├── baseline/{checkpoints,best}
 │   │   ├── transfer/{checkpoints,best}
 │   │   ├── joint/{checkpoints,best}
-│   │   └── baseline_untied/{checkpoints,best}
+│   │   ├── baseline_untied/{checkpoints,best}
+│   │   └── joint_untied/{checkpoints,best}
 │   ├── results/
-│   │   └── baseline.json / transfer.json / joint.json / baseline_untied.json
+│   │   └── baseline.json / transfer.json / joint.json / baseline_untied.json / joint_untied.json
 │   └── logs/
 ├── src/
 │   ├── prepare_data.py
-│   ├── train.py              # --source {base,summarization,joint,base_untied}
-│   ├── evaluate_model.py     # --source {base,summarization,joint,base_untied}
+│   ├── train.py              # --source {base,summarization,joint,base_untied,joint_untied}
+│   ├── evaluate_model.py     # --source {base,summarization,joint,base_untied,joint_untied}
 │   └── compare_results.py
-├── run_all.sh                # trains + evaluates all four conditions end to end
+├── run_all.sh                # trains + evaluates all five conditions end to end
 ├── requirements.txt
 └── README.md
 ```

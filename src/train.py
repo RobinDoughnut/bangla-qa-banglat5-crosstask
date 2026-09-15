@@ -17,9 +17,15 @@ Four conditions, selected with --source:
                  count as `summarization` (296.9M vs 247.6M). Isolates whether the
                  `summarization` condition's gain over `base` comes from cross-task
                  transfer or merely from having more parameters.
+  joint_untied   same as joint (D_S + D_Q simultaneously, original pretrained
+                 checkpoint) but with tie_word_embeddings=False set before training,
+                 matching `joint`'s 247.6M-param model to `base_untied`/`transfer`'s
+                 296.9M. Isolates whether joint multi-task training's QA regression
+                 (vs. baseline) is affected by embedding capacity, the same question
+                 base_untied asks of the sequential-transfer condition.
 
 Same task/format/hyperparameters as bangla-qa-banglat5 and the base/summarization
-conditions above; the joint condition additionally mixes in D_S.
+conditions above; the joint and joint_untied conditions additionally mix in D_S.
 """
 
 import argparse
@@ -158,11 +164,12 @@ def tokenize_summary(examples, tokenizer):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["base", "summarization", "joint", "base_untied"], required=True,
+    parser.add_argument("--source", choices=["base", "summarization", "joint", "base_untied", "joint_untied"], required=True,
                          help="base = fine-tune from csebuetnlp/banglat5 on QA only; "
                               "summarization = continue fine-tuning from the summarization checkpoint (sequential transfer condition); "
                               "joint = fine-tune from csebuetnlp/banglat5 on D_S + D_Q simultaneously (multi-task joint-learning baseline); "
-                              "base_untied = same as base but with tie_word_embeddings=False (parameter-count ablation vs. summarization)")
+                              "base_untied = same as base but with tie_word_embeddings=False (parameter-count ablation vs. summarization); "
+                              "joint_untied = same as joint but with tie_word_embeddings=False (parameter-count ablation of joint)")
     args = parser.parse_args()
 
     if args.source == "base":
@@ -174,6 +181,9 @@ def main():
     elif args.source == "base_untied":
         model_name = BASE_MODEL
         output_dir = Path("outputs/model/baseline_untied")
+    elif args.source == "joint_untied":
+        model_name = BASE_MODEL
+        output_dir = Path("outputs/model/joint_untied")
     else:
         model_name = BASE_MODEL
         output_dir = Path("outputs/model/joint")
@@ -194,7 +204,7 @@ def main():
         print(f"Found {len(existing_checkpoints)} existing checkpoint(s) -- resuming from the latest.")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if args.source == "base_untied":
+    if args.source in ("base_untied", "joint_untied"):
         # tie_word_embeddings must be passed at load time, not set on model.config
         # after from_pretrained() returns: this checkpoint's on-disk shared.weight and
         # lm_head.weight already differ, so recent transformers versions refuse to
@@ -229,7 +239,7 @@ def main():
         desc="val (D_Q)",
     )
 
-    if args.source == "joint":
+    if args.source in ("joint", "joint_untied"):
         summary_train_ds = load_summary_json(SUMMARY_DATA_DIR / "train.json")
         summary_val_ds = load_summary_json(SUMMARY_DATA_DIR / "validation.json")
         print(f"  D_S train: {len(summary_train_ds):,}  D_S val: {len(summary_val_ds):,}")
@@ -252,7 +262,7 @@ def main():
         # only by their input prefix ("question: ... context: ..." vs "summarize: ...").
         train_features = concatenate_datasets([train_features, summary_train_features])
         val_features = concatenate_datasets([val_features, summary_val_features])
-        print(f"  joint train (D_Q + D_S): {len(train_features):,}  joint val: {len(val_features):,}")
+        print(f"  {args.source} train (D_Q + D_S): {len(train_features):,}  {args.source} val: {len(val_features):,}")
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     training_args = Seq2SeqTrainingArguments(
@@ -271,7 +281,7 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         predict_with_generate=True,
-        generation_max_length=SUMMARY_MAX_TARGET_LENGTH if args.source == "joint" else MAX_TARGET_LENGTH,
+        generation_max_length=SUMMARY_MAX_TARGET_LENGTH if args.source in ("joint", "joint_untied") else MAX_TARGET_LENGTH,
         bf16=use_bf16,
         report_to="none",
         logging_steps=200,

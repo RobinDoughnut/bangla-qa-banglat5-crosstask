@@ -2,14 +2,16 @@
 Evaluates a fine-tuned QA model on validation and test splits.
 Metrics: EM, F1, BERTScore-F1 -- identical to bangla-qa-banglat5.
 
-For --source joint, also evaluates the same checkpoint on D_S (summarization,
-data/summary_bn) with ROUGE-1/2/L, since that condition was trained on both tasks.
+For --source joint or joint_untied, also evaluates the same checkpoint on D_S
+(summarization, data/summary_bn) with ROUGE-1/2/L, since those conditions were
+trained on both tasks.
 
 Usage:
   python src/evaluate_model.py --source base
   python src/evaluate_model.py --source summarization
   python src/evaluate_model.py --source joint
   python src/evaluate_model.py --source base_untied
+  python src/evaluate_model.py --source joint_untied
 """
 
 import argparse
@@ -202,10 +204,10 @@ def evaluate_split(split, tokenizer, model, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["base", "summarization", "joint", "base_untied"], required=True)
+    parser.add_argument("--source", choices=["base", "summarization", "joint", "base_untied", "joint_untied"], required=True)
     args = parser.parse_args()
     condition = {"base": "baseline", "summarization": "transfer", "joint": "joint",
-                 "base_untied": "baseline_untied"}[args.source]
+                 "base_untied": "baseline_untied", "joint_untied": "joint_untied"}[args.source]
     model_path = Path(f"outputs/model/{condition}/best")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -220,7 +222,7 @@ def main():
         metrics = evaluate_split(split, tokenizer, model, device)
         results[split] = metrics
 
-    if args.source == "joint":
+    if args.source in ("joint", "joint_untied"):
         results["summary_bn"] = {}
         for split in ["validation", "test"]:
             results["summary_bn"][split] = evaluate_summary_split(split, tokenizer, model, device)
